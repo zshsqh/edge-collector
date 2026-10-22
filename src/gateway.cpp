@@ -7,21 +7,35 @@
 #include <sys/socket.h>
 #include <unistd.h>
 #include <string>
-
+#include "device_message.h"
 namespace {
 constexpr uint16_t kPort = 9000;
 
 void handle_client(int client_fd)
 {
     while (true) {
-        std::string message;
-        if (!tcp::recv_message(client_fd, message)) {
-            std::cout << "Client closed or receive failed.\n";
-            break;
-        }
-        std::cout << "Received (" << message.size() << " bytes): "
-                  << message << '\n';
-        if (!tcp::send_message(client_fd, "ACK: " + message)) {
+        std::string raw;
+
+if (!tcp::recv_message(client_fd, raw)) {
+    // 按你现有的连接处理逻辑退出接收循环
+    break;
+}
+
+DeviceMessage msg;
+std::string error;
+
+if (!parse_device_message(raw, msg, error)) {
+    std::cerr << "Invalid message: "
+              << error << '\n';
+    continue;
+}
+
+std::cout << "device=" << msg.device_id
+          << ", seq=" << msg.sequence
+          << ", timestamp=" << msg.timestamp_ms
+          << ", temperature=" << msg.temperature_c
+          << '\n';
+        if (!tcp::send_message(client_fd, "ACK: " + raw)) {
             std::cerr << "send_message failed: " << std::strerror(errno) << '\n';
             break;
         }

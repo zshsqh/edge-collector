@@ -40,7 +40,8 @@ int i=1;
 while(i<20){
  data+=0.1;
 std::ostringstream oss;
-oss<<"device"<< i <<"time:"<<data;
+
+oss<<"device|"<< i <<"|"<< "00000000000000000000000000000001" <<"|"<<data;
         std::string message_sim=oss.str();
 tcp::send_message(client_fd,message_sim);
 usleep(100000);
