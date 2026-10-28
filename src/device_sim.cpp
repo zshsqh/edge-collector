@@ -1,3 +1,5 @@
+#include <thread>
+#include <chrono>
 #include "protocol.h"
 #include "sstream"
 #include "iomanip"
@@ -35,34 +37,31 @@ int main()
     std::cout << "Connected to 127.0.0.1:" << kPort
               << "\nType a message and press Enter; type quit to exit.\n";
     std::string message;
-  double data=25.6;
-int i=1;
-while(i<20){
- data+=0.1;
-std::ostringstream oss;
-
-oss<<"device|"<< i <<"|"<< "00000000000000000000000000000001" <<"|"<<data;
-        std::string message_sim=oss.str();
-tcp::send_message(client_fd,message_sim);
-usleep(100000);
-i++;
-}
     while (std::getline(std::cin, message)) {
         if (message == "quit") break;
-        /*if (!tcp::send_message(client_fd, message)) {
-            std::cerr << "send_message failed: " << std::strerror(errno) << '\n';
-            break;
-        }*/
-	
-        std::string reply;
-        if (!tcp::recv_message(client_fd, reply)) {
-            std::cerr << "Server closed the connection or receive failed.\n";
-            break;
-        }
-        std::cout << "Reply: " << reply << '\n';
-	usleep(100);
-    }
+        if (!tcp::send_message(client_fd, message)) {
+    std::cerr << "[device] send failed\n";
+    break;
+}	
+        std::string response;
 
+if (!tcp::recv_message(client_fd, response)) {
+    std::cerr << "[device] failed to receive response\n";
+    break;
+}
+
+std::cout << "[device] response: "
+          << response << '\n';
+
+if (response != "GATEWAY_STORED") {
+    std::cerr << "[device] message was not accepted: "
+              << response << '\n';
+    break;
+}
+
+std::this_thread::sleep_for(
+    std::chrono::milliseconds(100)
+);}
     close(client_fd);
     std::cout << "Client exited.\n";
     return 0;
