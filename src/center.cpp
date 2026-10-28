@@ -1,7 +1,7 @@
 #include <sqlite3.h>
 #include "protocol.h"
 #include "device_message.h"
-
+#include <cstdlib>
 #include <arpa/inet.h>
 #include <cerrno>
 #include <cstring>
@@ -210,7 +210,8 @@ bool persist_center_message(
     return true;
 }
 
-void handle_client(int client_fd,sqlite3* db)
+void handle_client(int client_fd,sqlite3* db,const std::string& drop_ack_id,
+    bool& ack_dropped)
 {
     
 std::string envelope;
@@ -251,7 +252,19 @@ if (!persist_center_message(db, message_id, msg, raw, error)) {
     close(client_fd);
     return;
 }
+// 仅用于故障注入测试
+if (!ack_dropped &&
+    !drop_ack_id.empty() &&
+    message_id == drop_ack_id)
+{
+    ack_dropped = true;
 
+    std::cerr << "[FAULT] ACK dropped for "
+              << message_id << '\n';
+
+    close(client_fd);
+    return;
+}
 std::cout << "[center] stored message_id="
           << message_id
           << " device=" << msg.device_id
@@ -267,6 +280,12 @@ close(client_fd);
 
 int main()
 {
+const char* env = std::getenv("CENTER_DROP_ACK_ID");
+
+const std::string drop_ack_id =
+    env ? env : "";
+
+bool ack_dropped = false;
     const int server_fd = socket(AF_INET, SOCK_STREAM, 0);
 	sqlite3* db = nullptr;
 std::string error;
@@ -333,7 +352,7 @@ if (!init_center_db(db, error)) {
             continue;
         }
 
-        handle_client(client_fd,db);
+        handle_client(client_fd,db, drop_ack_id, ack_dropped);
     }
 
     close(server_fd);

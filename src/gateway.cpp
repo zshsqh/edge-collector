@@ -178,7 +178,13 @@ void handle_device(int client_fd, LocalStore& store)
 
             continue;
         }
-
+if (msg.event_id.empty()) {
+    if (!tcp::send_message(
+            client_fd, "EVENT_ID_REQUIRED")) {
+        break;
+    }
+    continue;
+}
         // 第二步：保存并取得本地记录ID
         sqlite3_int64 local_id = 0;
 
