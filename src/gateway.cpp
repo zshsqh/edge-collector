@@ -1,4 +1,7 @@
 #include "local_store.h"
+#include <poll.h>
+#include <pthread.h>
+#include <sys/signalfd.h>
 #include <sys/time.h>
 #include "protocol.h"
 #include "device_message.h"
@@ -14,7 +17,8 @@
 #include <string>
 #include <sys/socket.h>
 #include <unistd.h>
-
+#include "net_timeout.h"
+#include <signal.h>
 namespace {
 constexpr uint16_t kGatewayPort = 9000;
 constexpr uint16_t kCenterPort = 9001;
@@ -28,40 +32,45 @@ bool forward_to_center(
 {
     const int fd = socket(AF_INET, SOCK_STREAM, 0);
 
-    if (fd < 0) {
-        return false;
-    }
-
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(kCenterPort);
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-timeval timeout{};
-timeout.tv_sec = 2;
-
-if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO,
-               &timeout, sizeof(timeout)) < 0 ||
-    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO,
-               &timeout, sizeof(timeout)) < 0) {
-    close(fd);
+if (fd < 0)
     return false;
-}
-    if (connect(fd,
-                reinterpret_cast<sockaddr*>(&addr),
-                sizeof(addr)) < 0) {
-        close(fd);
-        return false;
-    }
 
-    // 用换行分隔消息ID和原始设备消息
-    const std::string envelope = message_id + "\n" + raw;
+sockaddr_in addr{};
+addr.sin_family = AF_INET;
+addr.sin_port = htons(kCenterPort);
+addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
 
-    const bool ok =
+bool ok =
+    set_io_timeout(fd, 2000) &&
+    connect_with_timeout(
+        fd,
+        reinterpret_cast<sockaddr*>(&addr),
+        sizeof(addr),
+        2000
+    );
+
+if (ok) {
+    const std::string envelope =
+        message_id + "\n" + raw;
+
+    ok =
         tcp::send_message(fd, envelope) &&
         tcp::recv_message(fd, center_response);
+}
+
+if (!ok) {
+    const int saved_errno = errno;
+
+    std::cerr << "[network] center communication failed: "
+              << std::strerror(saved_errno) << '\n';
 
     close(fd);
-    return ok;
+    errno = saved_errno;
+    return false;
+}
+
+close(fd);
+return true;
 }
 
 
@@ -107,12 +116,27 @@ void retry_pending(
             std::string parse_error;
 
             if (!parse_device_message(
-                    item.payload, parsed, parse_error)) {
-                std::cerr << "[retry] invalid record id="
-                          << item.id << ": "
-                          << parse_error << '\n';
-                continue;
-            }
+        item.payload, parsed, parse_error)) {
+
+    std::string db_error;
+
+    if (!store.mark_quarantined(
+            item.id,
+            "invalid payload: " + parse_error,
+            db_error)) {
+
+        std::cerr << "[retry] quarantine failed: "
+                  << db_error << '\n';
+
+        failed = true;
+        break;
+    }
+
+    std::cerr << "[retry] quarantined id="
+              << item.id << '\n';
+
+    continue;
+}
 
             // 必须使用原来的本地记录ID
             const std::string message_id =
@@ -129,12 +153,28 @@ void retry_pending(
                 break;
             }
 
-            if (response != "CENTER_STORED") {
-                std::cerr << "[retry] center response: "
-                          << response << '\n';
-                failed = true;
-                break;
-            }
+            if (!parse_device_message(
+        item.payload, parsed, parse_error)) {
+
+    std::string db_error;
+
+    if (!store.mark_quarantined(
+            item.id,
+            "invalid payload: " + parse_error,
+            db_error)) {
+
+        std::cerr << "[retry] quarantine failed: "
+                  << db_error << '\n';
+
+        failed = true;
+        break;
+    }
+
+    std::cerr << "[retry] quarantined id="
+              << item.id << '\n';
+
+    continue;
+}
 
             if (!store.mark_delivered(item.id, error)) {
                 std::cerr << "[retry] update failed: "
@@ -156,10 +196,19 @@ void retry_pending(
     }
 }
 
-void handle_device(int client_fd, LocalStore& store)
+void handle_device(int client_fd, LocalStore& store,int signal_fd)
 {
+
     while (true) {
         std::string raw;
+pollfd stop_event{};
+ stop_event.fd = signal_fd;
+ stop_event.events = POLLIN;
+
+ if (poll(&stop_event, 1, 0) > 0 &&
+     (stop_event.revents & POLLIN)) {
+     break;
+ }
 
         if (!tcp::recv_message(client_fd, raw)) {
             std::cout << "[gateway] device disconnected\n";
@@ -257,39 +306,111 @@ if (!store.open("data/gateway.db", error)) {
         close(server_fd);
         return 1;
     }
+
+sigset_t signal_mask;
+sigemptyset(&signal_mask);
+
+sigaddset(&signal_mask, SIGINT);
+sigaddset(&signal_mask, SIGTERM);
+
+// 必须在创建后台线程之前屏蔽这些信号
+int mask_rc = pthread_sigmask(
+    SIG_BLOCK, &signal_mask, nullptr
+);
+
+if (mask_rc != 0) {
+    std::cerr << "pthread_sigmask failed: "
+              << std::strerror(mask_rc) << '\n';
+    close(server_fd);
+    return 1;
+}
+
+int signal_fd = signalfd(
+    -1,
+    &signal_mask,
+    SFD_CLOEXEC | SFD_NONBLOCK
+);
+
+if (signal_fd < 0) {
+    std::cerr << "signalfd failed: "
+              << std::strerror(errno) << '\n';
+    close(server_fd);
+    return 1;
+}
+
 std::atomic<bool> running{true};
 
 std::thread retry_thread([&]() {
     retry_pending(store, running);
 });
     std::cout << "[gateway] listening on 127.0.0.1:"
-              << kGatewayPort << '\n';
+              << kGatewayPort << '\n';        
+while (true) {
+    pollfd fds[2]{};
 
-    while (true) {
-        sockaddr_in peer{};
-        socklen_t peer_len = sizeof(peer);
+    fds[0].fd = server_fd;
+    fds[0].events = POLLIN;
 
-        const int client_fd = accept(
-            server_fd,
-            reinterpret_cast<sockaddr*>(&peer),
-            &peer_len
-        );
+    fds[1].fd = signal_fd;
+    fds[1].events = POLLIN;
+
+    const int n = poll(fds, 2, 500);
+
+    if (n < 0) {
+        if (errno == EINTR)
+            continue;
+
+        std::cerr << "[gateway] poll failed: "
+                  << std::strerror(errno) << '\n';
+        break;
+    }
+
+    if (n == 0)
+        continue;
+
+    // 优先处理关闭信号
+    if (fds[1].revents & POLLIN) {
+        std::cout << "[gateway] shutdown requested\n";
+        break;
+    }
+
+    if (fds[0].revents &
+        (POLLERR | POLLHUP | POLLNVAL)) {
+        std::cerr << "[gateway] listener error\n";
+        break;
+    }
+
+    if (fds[0].revents & POLLIN) {
+        const int client_fd =
+            accept(server_fd, nullptr, nullptr);
 
         if (client_fd < 0) {
-            if (errno == EINTR) {
+            if (errno == EINTR)
                 continue;
-            }
 
-            std::cerr << "accept failed: "
+            std::cerr << "[gateway] accept failed: "
                       << std::strerror(errno) << '\n';
             continue;
         }
 
-        handle_device(client_fd, store);
-    }
-running = false;
-retry_thread.join();
-    close(server_fd);
-    return 0;
+        // 对设备连接也设置I/O超时
+        if (!set_io_timeout(client_fd, 2000)) {
+            close(client_fd);
+            continue;
+        }
 
+        handle_device(client_fd, store, signal_fd);
+    }
+}
+running.store(false);
+
+if (retry_thread.joinable()) {
+    retry_thread.join();
+}
+
+close(signal_fd);
+close(server_fd);
+
+std::cout << "[gateway] shutdown complete\n";
+return 0;
 }

@@ -146,7 +146,15 @@ bool LocalStore::open(
         error)) {
         return fail();
     }
-
+if (!exec(
+    "CREATE TABLE IF NOT EXISTS outbox_quarantine ("
+    "outbox_id INTEGER PRIMARY KEY,"
+    "reason TEXT NOT NULL,"
+    "created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP"
+    ");",
+    error)) {
+    return fail();
+}
     return true;
 }
 
@@ -389,9 +397,14 @@ bool LocalStore::load_pending_after(
 
     int rc = sqlite3_prepare_v2(
         db_,
-        "SELECT id,payload FROM outbox "
-        "WHERE delivered=0 AND id>?1 "
-        "ORDER BY id LIMIT 100;",
+        "SELECT o.id, o.payload FROM outbox AS o "
+    "WHERE o.delivered = 0 "
+    "AND o.id > ?1 "
+    "AND NOT EXISTS ("
+    "  SELECT 1 FROM outbox_quarantine AS q "
+    "  WHERE q.outbox_id = o.id"
+    ") "
+    "ORDER BY o.id LIMIT 100;",
         -1, &stmt, nullptr);
 
     if (rc == SQLITE_OK)
@@ -449,4 +462,65 @@ bool LocalStore::load_pending_after(
         messages.clear();
 
     return ok;
+}
+
+bool LocalStore::mark_quarantined(
+    sqlite3_int64 row_id,
+    const std::string& reason,
+    std::string& error)
+{
+    std::lock_guard<std::mutex> lock(db_mutex_);
+    error.clear();
+
+    if (db_ == nullptr) {
+        error = "database not open";
+        return false;
+    }
+
+    const char* sql =
+        "INSERT INTO outbox_quarantine(outbox_id, reason) "
+        "VALUES(?1, ?2) "
+        "ON CONFLICT(outbox_id) DO UPDATE SET "
+        "reason = excluded.reason;";
+
+    sqlite3_stmt* stmt = nullptr;
+
+    int rc = sqlite3_prepare_v2(
+        db_, sql, -1, &stmt, nullptr
+    );
+
+    if (rc == SQLITE_OK) {
+        rc = sqlite3_bind_int64(
+            stmt, 1, row_id
+        );
+    }
+
+    if (rc == SQLITE_OK) {
+        rc = sqlite3_bind_text(
+            stmt, 2, reason.c_str(),
+            -1, SQLITE_TRANSIENT
+        );
+    }
+
+    if (rc == SQLITE_OK) {
+        rc = sqlite3_step(stmt);
+    }
+
+    bool success = (rc == SQLITE_DONE);
+
+    if (!success) {
+        error = sqlite3_errmsg(db_);
+    }
+
+    const int finalize_rc =
+        stmt ? sqlite3_finalize(stmt) : SQLITE_OK;
+
+    if (finalize_rc != SQLITE_OK) {
+        if (error.empty())
+            error = sqlite3_errmsg(db_);
+
+        success = false;
+    }
+
+    return success;
 }

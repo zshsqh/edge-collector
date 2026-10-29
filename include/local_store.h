@@ -14,6 +14,11 @@ public:
 bool load_pending_after(sqlite3_int64 after_id,
     std::vector<PendingMessage>& messages,
     std::string& error
+);
+bool mark_quarantined(
+    sqlite3_int64 row_id,
+    const std::string& reason,
+    std::string& error
 );  
   LocalStore() = default;
     ~LocalStore();
