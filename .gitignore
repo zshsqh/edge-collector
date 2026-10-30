@@ -1,0 +1,17 @@
+# CMake build directories
+/build/
+/build_check/
+
+# SQLite runtime data and backups
+/data/
+
+# Compiled test binary
+/tests/day10_bench
+
+# Compiler outputs
+*.o
+*.out
+
+# Editor temporary files
+*.swp
+*~

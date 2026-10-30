@@ -1,3 +1,4 @@
+#include <netinet/tcp.h>
 #include "local_store.h"
 #include <poll.h>
 #include <pthread.h>
@@ -19,9 +20,18 @@
 #include <unistd.h>
 #include "net_timeout.h"
 #include <signal.h>
+#include <memory>
+#include <exception>
+#include <system_error>
 namespace {
 constexpr uint16_t kGatewayPort = 9000;
 constexpr uint16_t kCenterPort = 9001;
+struct ClientWorker {
+     std::thread thread;
+
+     // true表示工作函数已经执行完成
+     std::shared_ptr<std::atomic<bool>> finished;
+ };
 
 // 将一条已经校验过的消息转发给中心服务。
 
@@ -200,7 +210,6 @@ void handle_device(int client_fd, LocalStore& store,int signal_fd)
 {
 
     while (true) {
-        std::string raw;
 pollfd stop_event{};
  stop_event.fd = signal_fd;
  stop_event.events = POLLIN;
@@ -210,11 +219,57 @@ pollfd stop_event{};
      break;
  }
 
-        if (!tcp::recv_message(client_fd, raw)) {
-            std::cout << "[gateway] device disconnected\n";
-            break;
+        pollfd fds[2]{};
+
+    // 监听设备Socket是否有数据
+    fds[0].fd = client_fd;
+    fds[0].events = POLLIN;
+
+    // 监听网关是否需要退出
+    fds[1].fd = signal_fd;
+    fds[1].events = POLLIN;
+
+    int rc = poll(fds, 2, 500);
+
+    if (rc < 0) {
+        if (errno == EINTR) {
+            continue;
         }
 
+        perror("[gateway] poll");
+        break;
+    }
+
+    if (rc == 0) {
+        // 500ms内设备没有数据
+        // 不断开连接，重新等待
+        continue;
+    }
+
+    // 网关准备退出
+    if (fds[1].revents & POLLIN) {
+        break;
+    }
+
+    // 连接出错或关闭
+    if (fds[0].revents &
+        (POLLERR | POLLHUP | POLLNVAL)) {
+        break;
+    }
+
+    // 没有可读事件
+    if (!(fds[0].revents & POLLIN)) {
+        continue;
+    }
+
+    // 确认可读后，才调用recv_message
+    std::string raw;
+
+    if (!tcp::recv_message(client_fd, raw)) {
+        std::cout
+            << "[gateway] device disconnected\n";
+        break;
+    }
         DeviceMessage msg;
         std::string error;
 
@@ -265,11 +320,44 @@ if (msg.event_id.empty()) {
 }
     close(client_fd);
 }}
+
+void reap_finished_workers(
+    std::vector<ClientWorker>& workers)
+{
+    auto it = workers.begin();
+
+    while (it != workers.end()) {
+
+        bool finished = it->finished->load(
+            std::memory_order_acquire
+        );
+
+        if (!finished) {
+            ++it;
+            continue;
+        }
+
+        // 只对已经完成工作函数的线程执行join
+        if (it->thread.joinable()) {
+            it->thread.join();
+        }
+
+        // join之后，才能安全删除线程对象
+        it = workers.erase(it);
+    }
+}
+
 int main()
 {
 LocalStore store;
 std::string error;
+constexpr std::size_t kMaxClients = 4;
 
+std::vector<ClientWorker> client_workers;
+
+// 预留4个元素的空间，避免新增线程后
+// vector因扩容而重新分配内存
+client_workers.reserve(kMaxClients);
 if (!store.open("data/gateway.db", error)) {
     std::cerr << "[gateway] SQLite init failed: "
               << error << '\n';
@@ -346,6 +434,7 @@ std::thread retry_thread([&]() {
     std::cout << "[gateway] listening on 127.0.0.1:"
               << kGatewayPort << '\n';        
 while (true) {
+reap_finished_workers(client_workers);
     pollfd fds[2]{};
 
     fds[0].fd = server_fd;
@@ -388,22 +477,97 @@ while (true) {
             if (errno == EINTR)
                 continue;
 
-            std::cerr << "[gateway] accept failed: "
-                      << std::strerror(errno) << '\n';
-            continue;
+        
         }
+reap_finished_workers(client_workers);
+int enabled = 1;
 
+if (setsockopt(
+        client_fd,
+        IPPROTO_TCP,
+        TCP_NODELAY,
+        &enabled,
+        sizeof(enabled)) < 0) {
+
+    perror("[gateway] TCP_NODELAY");
+    close(client_fd);
+    continue;
+}
+// 达到并发上限，拒绝新连接
+if (client_workers.size() >= kMaxClients) {
+    std::cerr
+        << "[gateway] too many clients, reject\n";
+
+    close(client_fd);
+    continue;
+}
         // 对设备连接也设置I/O超时
         if (!set_io_timeout(client_fd, 2000)) {
             close(client_fd);
             continue;
         }
 
-        handle_device(client_fd, store, signal_fd);
-    }
+    try {
+    auto finished =
+        std::make_shared<std::atomic<bool>>(false);
+
+    client_workers.push_back(ClientWorker{
+        std::thread(
+            [client_fd, &store, signal_fd, finished]() {
+
+                // handle_device负责关闭client_fd
+                handle_device(
+                    client_fd,
+                    store,
+                    signal_fd
+                );
+
+                // 工作函数结束，通知主线程回收
+                finished->store(
+                    true,
+                    std::memory_order_release
+                );
+            }
+        ),
+        finished
+    });
+
+    std::cout
+        << "[gateway] active clients: "
+        << client_workers.size()
+        << '\n';
+}
+catch (const std::exception& e) {
+    std::cerr
+        << "[gateway] thread creation failed: "
+        << e.what()
+        << '\n';
+
+    // 线程未成功交接时，主线程关闭fd
+    close(client_fd);
+}
+   }
 }
 running.store(false);
 
+running.store(false);
+
+// 等待所有客户端线程结束
+for (ClientWorker& worker : client_workers) {
+    if (worker.thread.joinable()) {
+        worker.thread.join();
+    }
+}
+
+client_workers.clear();
+
+// 等待补传线程结束
+if (retry_thread.joinable()) {
+    retry_thread.join();
+}
+
+// 最后才关闭signal_fd、server_fd
+// 并让LocalStore在生命周期结束时析构
 if (retry_thread.joinable()) {
     retry_thread.join();
 }
